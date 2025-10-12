@@ -328,7 +328,11 @@ class Config(GObject.Object):
                 else:
                     logger.info(
                         f"Configured device {configured_device} is not available choose {self._device} instead. Available gpus: {available_gpus}")
-                self._device = f"cuda:{available_gpus[0][0]}"
+                # Handle MPS device separately
+                if available_gpus[0][0] == "mps":
+                    self._device = "mps"
+                else:
+                    self._device = f"cuda:{available_gpus[0][0]}"
 
     def validate_and_set_restoration_model(self, restoration_model_name: str):
         available_models = get_available_restoration_models()

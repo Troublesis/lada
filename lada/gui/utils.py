@@ -17,7 +17,9 @@ def is_device_available(device: str) -> bool:
     if device == 'cpu':
         return True
     elif device.startswith("cuda:"):
-        return device_to_gpu_id(device) < torch.cuda.device_count()
+        return torch.cuda.is_available() and device_to_gpu_id(device) < torch.cuda.device_count()
+    elif device == 'mps':
+        return torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
     return False
 
 
@@ -29,6 +31,8 @@ def device_to_gpu_id(device) -> int | None:
 
 def get_available_gpus():
     gpus = []
+    
+    # Add CUDA GPUs
     for id in range(torch.cuda.device_count()):
         gpu_name = torch.cuda.get_device_properties(id).name
         # We're using these GPU names in a ComboBox but libadwaita sets up the label with max-width-chars: 20 and there does not
@@ -36,6 +40,11 @@ def get_available_gpus():
         if gpu_name.startswith("NVIDIA GeForce RTX"):
             gpu_name = gpu_name.replace("NVIDIA GeForce RTX", "RTX")
         gpus.append((id, gpu_name))
+    
+    # Add Apple Silicon GPU (MPS)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        gpus.append(("mps", "Apple Silicon GPU"))
+    
     return gpus
 
 def skip_if_uninitialized(f):

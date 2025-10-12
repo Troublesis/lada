@@ -38,7 +38,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--input', type=str, help=_('Path to pixelated video file or directory containing video files'))
     parser.add_argument('--output', type=str, help=_('Path used to save output file(s). If path is a directory then file name will be chosen automatically (see --output-file-pattern). If no output path was given then the directory of the input file will be used'))
     parser.add_argument('--output-file-pattern', type=str, default="{orig_file_name}.restored.mp4", help=_("Pattern used to determine output file name(s). Used when input is a directory or a file with no output path specified"))
-    parser.add_argument('--device', type=str, default="cuda:0", help=_('Device used for running Restoration and Detection models. Use "cpu" or "cuda". If you have multiple GPUs you can select a specific one via index e.g. "cuda:0" (default: %(default)s)'))
+    parser.add_argument('--device', type=str, default="cuda:0", help=_('Device used for running Restoration and Detection models. Use "cpu", "cuda", or "mps" (for Apple Silicon). If you have multiple GPUs you can select a specific one via index e.g. "cuda:0" (default: %(default)s)'))
     parser.add_argument('--list-devices', action='store_true', help=_("List available devices and exit"))
     parser.add_argument('--version', action='store_true', help=_("Display version and exit"))
 
@@ -111,9 +111,16 @@ def dump_torch_devices():
     s += f"\n\t{device_header}\t{description_header}"
     s += f"\n\t{len(device_header)*"-"}\t{len(description_header)*"-"}"
     s += "\n\tcpu\tCPU"
+    
+    # Add CUDA devices
     for i in range(torch.cuda.device_count()):
         gpu_name = torch.cuda.get_device_properties(i).name
         s += f"\n\tcuda:{i}\t{gpu_name}"
+    
+    # Add MPS device for Apple Silicon
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        s += "\n\tmps\tApple Silicon GPU (Metal Performance Shaders)"
+    
     print(s)
 
 def dump_available_detection_models():
@@ -252,6 +259,9 @@ def main():
         sys.exit(0)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print(_(f"GPU {args.device} selected but CUDA is not available"))
+        sys.exit(1)
+    if args.device == "mps" and (not hasattr(torch.backends, 'mps') or not torch.backends.mps.is_available()):
+        print(_("MPS device selected but Metal Performance Shaders are not available (requires macOS 13.0+ on Apple Silicon)"))
         sys.exit(1)
     if "{orig_file_name}" not in args.output_file_pattern or "." not in args.output_file_pattern:
         print(_("Invalid file name pattern. It must include the template string '{orig_file_name}' and a file extension"))
