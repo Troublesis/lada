@@ -7,3 +7,5 @@ experiments/
 .idea
 .flatpak-builder
 __pycache__
+data/**
+.DS_Store
