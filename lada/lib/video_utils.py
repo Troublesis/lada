@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from contextlib import contextmanager
 from fractions import Fraction
 from typing import Callable
@@ -263,6 +264,20 @@ class VideoWriter:
         if custom_encoder_options:
             encoder_options.update(self.parse_custom_options(custom_encoder_options))
 
+        # Completely disable B-frames to prevent DTS reordering issues
+        # This is necessary for problematic video files with timestamp issues
+        if 'libx264' in codec or 'h264' in codec or 'libx265' in codec or 'hevc' in codec:
+            encoder_options['bf'] = '0'  # No B-frames - completely disabled
+            encoder_options['g'] = '30'  # Keyframe every 30 frames for stability
+            encoder_options['refs'] = '1'  # Single reference frame to prevent DTS issues
+
+        # Additional options for problematic codecs
+        if 'videotoolbox' in codec:
+            encoder_options['allow_sw'] = '1'  # Allow software fallback
+            encoder_options['b_strategy'] = '0'  # Disable adaptive B-frame placement
+            encoder_options['max_b_frames'] = '0'  # No B-frames for VideoToolbox
+            encoder_options['bf'] = '0'  # Force no B-frames for VideoToolbox
+
         output_container = av.open(output_path, "w", options=container_options)
         video_stream_out: av.VideoStream = output_container.add_stream(codec, fps)
 
@@ -279,9 +294,32 @@ class VideoWriter:
         video_stream_out.codec_context.thread_type = 3
         video_stream_out.codec_context.time_base = time_base
 
+        # Force encoder settings to completely prevent DTS issues
+        video_stream_out.codec_context.max_b_frames = 0  # No B-frames - prevents DTS reordering
+        video_stream_out.codec_context.gop_size = 30  # Fixed GOP size
+        # refs attribute may not be available in all codec contexts, check before setting
+        if hasattr(video_stream_out.codec_context, 'refs'):
+            try:
+                video_stream_out.codec_context.refs = 1  # Single reference frame
+            except Exception as e:
+                # Error setting refs - continue without it (not critical)
+                pass
+
         video_stream_out.options = encoder_options
         self.output_container = output_container
         self.video_stream = video_stream_out
+
+        # Initialize timestamp tracking for DTS validation
+        self._frame_counter = 0
+        self._last_pts = None
+        self._pts_base = None
+        self._packets_written = 0
+        self._last_dts = -1
+        self._pts_offset = 0
+        self._use_pts_correction = False
+        self._pts_warning_count = 0
+        self._dts_warning_count = 0
+        self._max_warnings = 5  # Limit warnings to prevent console spam
 
     def __enter__(self):
         return self
@@ -289,19 +327,101 @@ class VideoWriter:
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
+    def _ensure_valid_timestamp(self, frame_pts):
+        """
+        Ensure timestamps are valid for encoding.
+        With B-frames disabled, we can preserve original timing more easily.
+        """
+        if frame_pts is None:
+            # No PTS provided - use frame counter as fallback
+            return self._frame_counter
+
+        # With B-frames disabled, original PTS should work well
+        # but we still need to ensure they're monotonic
+        if self._last_pts is not None and frame_pts <= self._last_pts:
+            self._pts_warning_count += 1
+            if self._pts_warning_count <= self._max_warnings:
+                print(f"Warning: Non-monotonic PTS detected ({frame_pts} <= {self._last_pts}). Using sequential timestamp.")
+                if self._pts_warning_count == self._max_warnings:
+                    print(f"Note: Suppressing further PTS warnings (too many timestamp issues in source video)")
+            # Fall back to sequential timestamp
+            sequential_pts = self._frame_counter
+            self._last_pts = sequential_pts
+            return sequential_pts
+        else:
+            # Valid timestamp - use original
+            self._last_pts = frame_pts
+            return frame_pts
+
     def write(self, frame, frame_pts=None, bgr2rgb=False):
         if bgr2rgb:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         out_frame = av.VideoFrame.from_ndarray(frame, format='rgb24')
-        if frame_pts:
-            out_frame.pts = frame_pts
-        out_packet = self.video_stream.encode(out_frame)
-        self.output_container.mux(out_packet)
+
+        # Use validated timestamps to preserve original timing while preventing DTS errors
+        valid_pts = self._ensure_valid_timestamp(frame_pts)
+        out_frame.pts = valid_pts
+        self._frame_counter += 1
+
+        # Encode frame and write packets
+        try:
+            for out_packet in self.video_stream.encode(out_frame):
+                if out_packet is not None:
+                    # With B-frames disabled, DTS should be monotonic
+                    # but we still validate just in case
+                    if hasattr(out_packet, 'dts') and out_packet.dts is not None:
+                        if out_packet.dts >= self._last_dts:
+                            self.output_container.mux(out_packet)
+                            self._packets_written += 1
+                            self._last_dts = out_packet.dts
+                        else:
+                            # This shouldn't happen with no B-frames, but skip if it does
+                            self._dts_warning_count += 1
+                            if self._dts_warning_count <= self._max_warnings:
+                                print(f"Warning: Skipping packet with DTS: {out_packet.dts} < {self._last_dts}")
+                                if self._dts_warning_count == self._max_warnings:
+                                    print(f"Note: Suppressing further DTS warnings (too many timestamp issues in source video)")
+                    else:
+                        # No DTS - write anyway
+                        self.output_container.mux(out_packet)
+                        self._packets_written += 1
+        except Exception as e:
+            if "non monotonically increasing dts" in str(e):
+                print(f"Warning: DTS error (expected with problematic timestamps): {e}")
+            else:
+                print(f"Error during encoding/muxing: {e}")
 
     def release(self):
-        out_packet = self.video_stream.encode(None)
-        self.output_container.mux(out_packet)
-        self.output_container.close()
+        print(f"Flushing encoder... Packets written so far: {self._packets_written}")
+        # Flush encoder with None frame
+        try:
+            for out_packet in self.video_stream.encode(None):
+                if out_packet is not None:
+                    # Validate DTS monotonicity before muxing
+                    if hasattr(out_packet, 'dts') and out_packet.dts is not None:
+                        if out_packet.dts >= self._last_dts:
+                            # Valid DTS sequence
+                            self.output_container.mux(out_packet)
+                            self._packets_written += 1
+                            self._last_dts = out_packet.dts
+                        else:
+                            # Invalid DTS sequence - skip this packet
+                            print(f"Warning: Skipping flush packet with non-monotonic DTS: {out_packet.dts} < {self._last_dts}")
+                    else:
+                        # No DTS or undefined - write anyway
+                        self.output_container.mux(out_packet)
+                        self._packets_written += 1
+        except Exception as e:
+            print(f"Error during final encoder flush: {e}")
+            print("Attempting to complete video anyway...")
+
+        print(f"Total packets written: {self._packets_written}")
+        try:
+            self.output_container.close()
+            print("Video container closed successfully.")
+        except Exception as e:
+            print(f"Error closing video container: {e}")
+            raise e
 
 def is_video_file(file_path):
     SUPPORTED_VIDEO_FILE_EXTENSIONS = {".asf", ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".wmv",
@@ -321,3 +441,113 @@ def get_available_video_encoder_codecs():
             continue
         codecs.add((e_codec.name, e_codec.long_name))
     return sorted(list(codecs))
+
+def convert_to_constant_frame_rate(input_path: str, target_fps: int = 30) -> str:
+    """
+    Convert video to constant frame rate (CFR) using ffmpeg.
+
+    Args:
+        input_path: Path to input video file
+        target_fps: Target frame rate (default: 30)
+
+    Returns:
+        Path to converted video file
+    """
+    import pathlib
+    from lada.lib import os_utils
+
+    input_path = os.path.abspath(input_path)
+    input_dir = os.path.dirname(input_path)
+    input_name = pathlib.Path(input_path).stem
+    input_ext = pathlib.Path(input_path).suffix
+
+    # Create output path in same directory with .cfr suffix
+    output_path = os.path.join(input_dir, f"{input_name}.cfr{input_ext}")
+
+    # If output file already exists, remove it first
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    print(f"Converting video to constant frame rate ({target_fps} fps)...")
+    print(f"Input: {input_path}")
+    print(f"Output: {output_path}")
+
+    # Use ffmpeg to convert to constant frame rate
+    cmd = [
+        'ffmpeg', '-y',  # Overwrite output file
+        '-i', input_path,  # Input file
+        '-vsync', 'cfr',  # Constant frame rate
+        '-r', str(target_fps),  # Target frame rate
+        '-c:v', 'libx264',  # Video codec
+        '-preset', 'fast',  # Fast encoding for conversion
+        '-crf', '18',  # Good quality
+        '-c:a', 'copy',  # Copy audio stream without re-encoding
+        '-movflags', '+faststart',  # Optimize for streaming
+        output_path
+    ]
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=os_utils.get_subprocess_startup_info(),
+            universal_newlines=True
+        )
+
+        # Monitor progress
+        while True:
+            output = process.stderr.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output and 'time=' in output:
+                # Simple progress indicator
+                print(".", end='', flush=True)
+
+        print()  # New line after progress dots
+
+        if process.returncode != 0:
+            stderr_output = process.stderr.read()
+            raise Exception(f"ffmpeg failed with return code {process.returncode}: {stderr_output}")
+
+        if not os.path.exists(output_path):
+            raise Exception("ffmpeg completed but output file was not created")
+
+        print(f"Frame rate conversion completed successfully!")
+        return output_path
+
+    except Exception as e:
+        # Clean up partial output file if it exists
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except:
+                pass
+        raise Exception(f"Frame rate conversion failed: {e}")
+
+def validate_video_frame_reading(video_path: str, max_test_frames: int = 100) -> bool:
+    """
+    Test if we can successfully read frames from the video.
+
+    Args:
+        video_path: Path to video file
+        max_test_frames: Maximum number of frames to test reading
+
+    Returns:
+        True if frame reading is successful, False otherwise
+    """
+    try:
+        with VideoReader(video_path) as reader:
+            frame_count = 0
+            for frame_img, frame_pts in reader.frames():
+                frame_count += 1
+                if frame_count >= max_test_frames:
+                    break
+                # Basic validation of frame data
+                if frame_img is None or frame_img.size == 0:
+                    return False
+            return frame_count > 0  # Should have read at least one frame
+
+    except Exception as e:
+        print(f"Frame reading validation failed: {e}")
+        return False

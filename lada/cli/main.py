@@ -17,7 +17,7 @@ from lada import MODEL_WEIGHTS_DIR, VERSION, DETECTION_MODEL_NAMES_TO_FILES, RES
     get_available_restoration_models, get_available_detection_models
 from lada.lib import audio_utils
 from lada.lib.frame_restorer import load_models, FrameRestorer
-from lada.lib.video_utils import get_video_meta_data, VideoWriter
+from lada.lib.video_utils import get_video_meta_data, VideoWriter, validate_video_frame_reading, convert_to_constant_frame_rate
 
 
 def setup_argparser() -> argparse.ArgumentParser:
@@ -153,42 +153,86 @@ def dump_available_restoration_models():
 
 def process_video_file(input_path: str, output_path: str, device, mosaic_restoration_model, mosaic_detection_model,
                        mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, codec, crf, moov_front, preset, custom_encoder_options, print_prefix=""):
-    video_metadata = get_video_meta_data(input_path)
+    original_input_path = input_path
+    temp_converted_file = None
+    frame_restorer = None
 
-    frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
-                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
-    success = True
-    video_tmp_file_output_path = os.path.join(tempfile.gettempdir(), f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
-    pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
     try:
-        frame_restorer.start()
+        # Validate that we can read frames from the video
+        print(f"{print_prefix}Validating video frame reading...")
+        if not validate_video_frame_reading(input_path, max_test_frames=50):
+            print(f"{print_prefix}Frame reading validation failed. Converting to constant frame rate...")
 
-        with VideoWriter(video_tmp_file_output_path, video_metadata.video_width, video_metadata.video_height,
-                         video_metadata.video_fps_exact, codec=codec, crf=crf, moov_front=moov_front,
-                         time_base=video_metadata.time_base, preset=preset,
-                         custom_encoder_options=custom_encoder_options) as video_writer:
-            for elem in tqdm(frame_restorer, total=video_metadata.frames_count, desc=_("Processing frames")):
-                if elem is None:
-                    success = False
-                    print("Error on export: frame restorer stopped prematurely")
-                    break
-                (restored_frame, restored_frame_pts) = elem
-                video_writer.write(restored_frame, restored_frame_pts, bgr2rgb=True)
-    except (Exception, KeyboardInterrupt) as e:
-        success = False
-        if isinstance(e, KeyboardInterrupt):
-            raise e
+            # Convert to constant frame rate
+            converted_path = convert_to_constant_frame_rate(input_path, target_fps=30)
+
+            # Validate the converted video
+            if not validate_video_frame_reading(converted_path, max_test_frames=50):
+                raise Exception("Frame reading still failed after conversion. Please check the video file.")
+
+            print(f"{print_prefix}Frame rate conversion successful. Using converted video.")
+            input_path = converted_path
+            temp_converted_file = converted_path
         else:
-            print("Error on export", e)
-    finally:
-        frame_restorer.stop()
+            print(f"{print_prefix}Video frame reading validation passed.")
 
-    if success:
-        print(_("Processing audio"))
-        audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, output_path)
-    else:
-        if os.path.exists(video_tmp_file_output_path):
-            os.remove(video_tmp_file_output_path)
+        video_metadata = get_video_meta_data(input_path)
+
+        frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
+                     mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
+
+        success = True
+        video_tmp_file_output_path = os.path.join(tempfile.gettempdir(), f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
+        pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
+
+        try:
+            frame_restorer.start()
+
+            with VideoWriter(video_tmp_file_output_path, video_metadata.video_width, video_metadata.video_height,
+                             video_metadata.video_fps_exact, codec=codec, crf=crf, moov_front=moov_front,
+                             time_base=video_metadata.time_base, preset=preset,
+                             custom_encoder_options=custom_encoder_options) as video_writer:
+                for elem in tqdm(frame_restorer, total=video_metadata.frames_count, desc=_("Processing frames")):
+                    if elem is None:
+                        success = False
+                        print("Error on export: frame restorer stopped prematurely")
+                        break
+                    (restored_frame, restored_frame_pts) = elem
+                    video_writer.write(restored_frame, restored_frame_pts, bgr2rgb=True)
+        except (Exception, KeyboardInterrupt) as e:
+            success = False
+            if isinstance(e, KeyboardInterrupt):
+                raise e
+            else:
+                print("Error on export", e)
+        finally:
+            if frame_restorer:
+                frame_restorer.stop()
+
+        if success:
+            print(_("Processing audio"))
+            audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, output_path)
+        else:
+            if os.path.exists(video_tmp_file_output_path):
+                os.remove(video_tmp_file_output_path)
+
+    except Exception as e:
+        # Clean up temporary converted file if an error occurred
+        if temp_converted_file and os.path.exists(temp_converted_file):
+            try:
+                os.remove(temp_converted_file)
+                print(f"{print_prefix}Cleaned up temporary converted file: {temp_converted_file}")
+            except Exception as cleanup_e:
+                print(f"{print_prefix}Warning: Could not clean up temporary file {temp_converted_file}: {cleanup_e}")
+        raise e
+
+    # Clean up temporary converted file on success
+    if temp_converted_file and os.path.exists(temp_converted_file):
+        try:
+            os.remove(temp_converted_file)
+            print(f"{print_prefix}Cleaned up temporary converted file: {temp_converted_file}")
+        except Exception as e:
+            print(f"{print_prefix}Warning: Could not clean up temporary file {temp_converted_file}: {e}")
 
 def setup_input_and_output_paths(input_arg, output_arg, output_file_pattern):
     single_file_input = os.path.isfile(input_arg)
